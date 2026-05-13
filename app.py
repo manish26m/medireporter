@@ -124,6 +124,7 @@ async def version_info():
 async def analyze_report(
     text: str = Form(None),
     file: UploadFile = File(None),
+    skip_lstm: str = Form("false"),
 ):
     """
     Main inference endpoint.
@@ -199,9 +200,10 @@ async def analyze_report(
         logger.warning("Input truncated to 50,000 chars.")
 
     # ── Run Pipeline ──────────────────────────────────────
+    use_lstm = skip_lstm.lower() not in ("true", "1", "yes")
     try:
-        logger.info("Processing report (len=%d chars)…", len(extracted_text))
-        results = pipeline.process(extracted_text)
+        logger.info("Processing report (len=%d chars, lstm=%s)…", len(extracted_text), use_lstm)
+        results = pipeline.process(extracted_text, use_lstm=use_lstm)
         logger.info(
             "Pipeline complete in %.2fs | risk=%s | entities=%d",
             results["metadata"]["processing_time_s"],

@@ -49,24 +49,45 @@ MODERATE_RISK_KEYWORDS = {
 #  MEDICAL STOPWORDS — these are NOT valid clinical entities
 # =============================================================
 MEDICAL_STOPWORDS = {
-    # Common abbreviations that slip through NER
+    # Common English words that slip through NER
     'the','and','for','with','this','that','they','them','when',
     'what','where','have','been','from','were','will','would',
     'could','should','which','there','their','about','after',
-    'before','during','through','between','patient','patients',
-    'history','past','present','year','years','month','months',
-    'day','days','week','weeks','male','female','aged','age',
-    'time','date','report','hospital','clinic','doctor','nurse',
-    'examination','exam','test','tests','result','results',
+    'before','during','through','between',
+    # Patient/clinical context words (not actual entities)
+    'patient','patients','history','past','present','year','years',
+    'month','months','day','days','week','weeks','male','female',
+    'aged','age','time','date','report','hospital','clinic',
+    'doctor','nurse','physician','examination','exam','level','levels',
+    # Generic clinical nouns that are NOT entities
+    'test','tests','result','results','finding','findings','measurement',
     'normal','negative','positive','noted','seen','found',
-    'showed','shows','showing','noted','complaints','complaint',
-    'pain','mild','moderate','severe','significant','associated',
+    'showed','shows','showing','complaint','complaints',
+    'medication','medications','medicine','medicines','drug','drugs',
+    'symptom','symptoms','condition','conditions','disease','diseases',
+    'treatment','treatments','procedure','procedures','diagnosis',
+    'gender','sex','lifestyle','modification','modifications',
+    # Social/demographic terms that BioBERT History-tags
+    'married','single','divorced','widowed','smoke','smoker','smoking',
+    'alcohol','drinker','tobacco','recreational','drug use',
+    'presentation','complaint','admission','discharge',
+    'allergy','allergies','allgies','alert','oriented',
+    # Clinical event / lab noise words
+    'presented','admitted','elevated','emergency','room','emergency room',
+    'suggestive','evaluation','follow','follow up','follow-up',
+    'recommended','prescribed','started','continued','continue',
+    'intake','restrict','restriction','consultation','therapy',
+    'oxygen','bed rest','bed','rest','sodium','intake',
+    'gentleman','lady','woman','man','person','individual',
+    # Qualifiers and descriptors
+    'mild','moderate','severe','significant','associated',
     'bilateral','right','left','upper','lower','anterior','posterior',
-    # 2-3 letter acronyms that are pure noise
+    'pain','blood','sugar','level','levels','pressure','rate',
+    # 2-3 letter clinical abbreviations that are pure noise
     'pt','hx','cc','bp','hr','rr','wbc','rbc','hgb','hct',
     'ekg','ecg','mri','cxr','abi','ast','alt','bun','cr',
     'na','mg','kg','dl','ml','mm','cm','iv','im','po','prn',
-    # Single characters or fragments
+    # Single chars
     'a','b','c','d','e','f','g','h','i','j','k','l','m',
     'n','o','p','q','r','s','t','u','v','w','x','y','z',
 }
@@ -167,10 +188,11 @@ class Seq2Seq(nn.Module):
         return outputs
 
 
-def lstm_generate_summary(model, article, vocab, idx2word, max_len=50) -> str:
+def _get_attention_scores(model, article: str, vocab: dict) -> tuple:
     """
-    Attention-based keyword extraction using the LSTM encoder.
-    Returns top-20 high-attention content words in source order.
+    Run the LSTM encoder and accumulate attention weights over the input tokens.
+    Returns (input_words, attn_scores_tensor) where attn_scores_tensor[i]
+    is the total attention the decoder paid to word i across all decode steps.
     """
     model.eval()
     unk_idx = vocab[UNK_TOKEN]
@@ -186,7 +208,7 @@ def lstm_generate_summary(model, article, vocab, idx2word, max_len=50) -> str:
         dec_input = torch.tensor([sos_idx]).to(DEVICE)
 
         attn_sum = torch.zeros(MAX_ARTICLE_LEN)
-        for _ in range(20):
+        for _ in range(30):           # more decode steps → more reliable attention map
             pred, hidden, cell = model.decoder(dec_input, hidden, cell, enc_out)
             attn_w = model.decoder.attention(hidden[-1], enc_out)
             attn_sum += attn_w.squeeze(0).cpu()
@@ -195,48 +217,113 @@ def lstm_generate_summary(model, article, vocab, idx2word, max_len=50) -> str:
             dec_input = pred.argmax(1)
 
         n_input     = len(input_words)
-        attn_scores = attn_sum[:n_input]
-        n_select    = min(20, n_input)
-        top_indices = sorted(attn_scores.argsort(descending=True)[:n_select].tolist())
+        attn_scores = attn_sum[:n_input]          # shape (n_input,)
+        return input_words, attn_scores
 
-        # Collect significant content words
-        content_stopwords = {
-            'the','a','an','is','was','were','are','of','to','and',
-            'in','for','with','on','at','by','that','this','it',
-            'be','has','had','have','been','will','would','could'
-        }
-        key_words = [
-            input_words[i] for i in top_indices
-            if i < n_input and input_words[i] not in content_stopwords
-        ]
 
-        summary = ' '.join(key_words)
-        summary = re.sub(r'\s+([.,])', r'\1', summary)
-        return re.sub(r'\s+', ' ', summary).strip()
+def lstm_select_sentences(model, article: str, vocab: dict,
+                          coverage: float = 0.55) -> tuple:
+    """
+    True extractive stage: score every sentence in the document using
+    LSTM encoder attention weights, then select the highest-scoring
+    sentences that together cover `coverage` fraction of the total
+    attention mass (default 55%).
 
+    Returns
+    -------
+    selected_text : str
+        The selected sentences joined as a paragraph — this is fed to BART.
+    keyword_display : str
+        Human-readable summary of what the LSTM selected (shown in the UI).
+    """
+    # -- Split original article into sentences (preserve original text, not lowercased)
+    raw_sentences = re.split(r'(?<=[.!?])\s+', article.strip())
+    raw_sentences = [s.strip() for s in raw_sentences if len(s.strip()) > 10]
+
+    if not raw_sentences:
+        return article, "No sentences extracted."
+
+    # -- Get per-token attention scores on the cleaned/lowercased version
+    input_words, attn_scores = _get_attention_scores(model, article, vocab)
+    total_attn = float(attn_scores.sum()) or 1.0
+
+    # Map each cleaned word index back to its sentence by reconstructing
+    # the cleaned token stream and aligning with raw sentences.
+    cleaned_words = clean_text(article).split()[:MAX_ARTICLE_LEN]
+
+    # Build a word→sentence index mapping via cumulative word count
+    sentence_cleaned_words = []
+    for s in raw_sentences:
+        sentence_cleaned_words.append(clean_text(s).split())
+
+    word_pos = 0
+    sentence_scores = []
+    for sent_words in sentence_cleaned_words:
+        n = len(sent_words)
+        # sum attention over the words belonging to this sentence
+        end = min(word_pos + n, len(attn_scores))
+        score = float(attn_scores[word_pos:end].sum())
+        sentence_scores.append(score)
+        word_pos += n
+
+    # Sort sentences by score (descending) and greedily select until
+    # we hit the coverage threshold
+    indexed = sorted(enumerate(sentence_scores), key=lambda x: x[1], reverse=True)
+    accumulated = 0.0
+    selected_indices = set()
+    for idx, score in indexed:
+        selected_indices.add(idx)
+        accumulated += score
+        if accumulated / total_attn >= coverage:
+            break
+
+    # Restore original document order
+    selected_sentences = [raw_sentences[i] for i in sorted(selected_indices)]
+    selected_text = ' '.join(selected_sentences)
+
+    n_total    = len(raw_sentences)
+    n_selected = len(selected_sentences)
+    keyword_display = (
+        f"LSTM selected {n_selected} of {n_total} sentences "
+        f"({round(accumulated/total_attn*100)}% attention coverage):\n\n"
+        + selected_text
+    )
+
+    return selected_text, keyword_display
 
 # =============================================================
 #  SECTION 2: NER POST-PROCESSING (Noise Elimination)
 # =============================================================
 
+# Negation/qualifier prefixes — entities starting with these should be excluded
+# (e.g. "No History Of Diabetes" should not appear as a Disease entity)
+NEGATION_PREFIXES = {
+    'no ', 'non ', 'non-', 'not ', 'without ', 'denies ', 'denied ',
+    'questionable ', 'possible ', 'probable ', 'unlikely ', 'does ', 'history of no ',
+    'no history', 'negative for ', 'absent ', 'ruled out',
+}
+
+
+def is_negated_entity(word: str) -> bool:
+    """Return True if the entity phrase starts with a negation/qualifier."""
+    w = word.lower().strip()
+    return any(w.startswith(prefix) for prefix in NEGATION_PREFIXES)
+
+
 def is_valid_entity(word: str, score: float,
-                    score_threshold: float = 0.87) -> bool:
+                    score_threshold: float = 0.80) -> bool:
     """
     Multi-layer validation to eliminate NER noise from BioBERT.
-
-    Rejects:
-    - Subword fragments starting with ## or containing ##
-    - Tokens shorter than 4 characters
-    - Pure numeric strings
-    - Tokens with special characters (except hyphens)
-    - Tokens in the medical stopword list
-    - Tokens below confidence threshold
     """
-    # 1. Remove leading/trailing whitespace
     word = word.strip()
 
-    # 2. Must have sufficient length
-    if len(word) < 4:
+    # 1. Must have sufficient length
+    if len(word) < 3:
+        return False
+
+    # 2. Single-word entities must be at least 4 characters
+    #    (blocks "Air", "Short", "Blurry", "ST-T" etc.)
+    if ' ' not in word and '-' not in word and len(word) < 4:
         return False
 
     # 3. Reject subword artifacts
@@ -255,8 +342,8 @@ def is_valid_entity(word: str, score: float,
     if word.lower() in MEDICAL_STOPWORDS:
         return False
 
-    # 7. Reject tokens that are entirely uppercase acronyms <= 4 chars
-    if word.isupper() and len(word) <= 4:
+    # 7. Reject single-word entities that are in stopwords after stripping hyphens
+    if word.replace('-', ' ').strip().lower() in MEDICAL_STOPWORDS:
         return False
 
     # 8. Confidence threshold check
@@ -416,7 +503,7 @@ class MediPipeline:
         self.ner_pipeline = hf_pipeline(
             "ner",
             model="d4data/biomedical-ner-all",
-            aggregation_strategy="simple",
+            aggregation_strategy="first",   # 'first' handles subwords better than 'simple'
             device=0 if torch.cuda.is_available() else -1
         )
         logger.info("BioBERT NER loaded.")
@@ -453,41 +540,64 @@ class MediPipeline:
         return all_raw
 
     # ----------------------------------------------------------
-    def process(self, text: str) -> dict:
+    def process(self, text: str, use_lstm: bool = True) -> dict:
         if not self._models_loaded:
             raise RuntimeError("Models are not loaded yet. Call load_models() first.")
 
         t_start = time.time()
         word_count = len(text.split())
 
-        # ── Stage 1: LSTM Keyword Extraction ──────────────────
-        lstm_out = "LSTM model not available on this deployment."
-        if self.lstm_model:
+        # ── Stage 1: LSTM Sentence Selection ──────────────────
+        lstm_out = "Skipped — running in High-Accuracy mode (BART + BioBERT only)."
+        bart_input_text = text  # Default to full text
+        
+        if use_lstm and self.lstm_model:
             try:
-                lstm_out = lstm_generate_summary(
-                    self.lstm_model, text, self.vocab, self.idx2word)
-                logger.debug("LSTM summary: %s", lstm_out[:80])
+                # LSTM scores sentences and selects the most relevant ones
+                filtered_text, lstm_out = lstm_select_sentences(
+                    self.lstm_model, text, self.vocab)
+                
+                # In standard mode, BART only sees the LSTM-filtered text
+                bart_input_text = filtered_text
+                logger.debug("LSTM selected text length: %d chars", len(filtered_text))
             except Exception as e:
                 lstm_out = f"LSTM error: {str(e)}"
                 logger.error("LSTM failed: %s", str(e))
 
         # ── Stage 2: BART Abstractive Summarization ───────────
+        # In high-accuracy mode: use stronger beam search for a more
+        # comprehensive, longer summary on the full text.
         bart_out = ""
         try:
             inputs = self.bart_tokenizer(
-                text, max_length=1024, truncation=True, return_tensors='pt'
+                bart_input_text, max_length=1024, truncation=True, return_tensors='pt'
             ).to(DEVICE)
             with torch.no_grad():
-                summary_ids = self.bart_model.generate(
-                    inputs['input_ids'],
-                    attention_mask=inputs['attention_mask'],
-                    max_length=180,
-                    min_length=40,
-                    num_beams=4,
-                    length_penalty=2.0,
-                    early_stopping=True,
-                    no_repeat_ngram_size=3,
-                )
+                if use_lstm:
+                    # Standard mode — fast, concise
+                    summary_ids = self.bart_model.generate(
+                        inputs['input_ids'],
+                        attention_mask=inputs['attention_mask'],
+                        max_length=180,
+                        min_length=40,
+                        num_beams=4,
+                        length_penalty=2.0,
+                        early_stopping=True,
+                        no_repeat_ngram_size=3,
+                    )
+                else:
+                    # High-accuracy mode — more beams, longer, no length bias
+                    summary_ids = self.bart_model.generate(
+                        inputs['input_ids'],
+                        attention_mask=inputs['attention_mask'],
+                        max_length=280,
+                        min_length=60,
+                        num_beams=8,
+                        length_penalty=1.0,
+                        early_stopping=False,
+                        no_repeat_ngram_size=4,
+                        repetition_penalty=1.5,
+                    )
             bart_out = self.bart_tokenizer.decode(
                 summary_ids[0], skip_special_tokens=True)
             logger.debug("BART summary: %s", bart_out[:80])
@@ -495,14 +605,23 @@ class MediPipeline:
             bart_out = f"BART error: {str(e)}"
             logger.error("BART failed: %s", str(e))
 
-        # ── Stage 3: BioBERT NER with Noise Elimination ───────
+        # ── Stage 3: BioBERT NER ───────────────────────────────
+        # IMPORTANT: These keys must match the model's actual entity_group
+        # output labels exactly (verified via diagnose_ner.py diagnostic).
         CAT_MAP = {
-            'Disease_disorder':                    'Disease',
-            'Sign_symptom':                        'Symptom',
-            'Medication':                          'Drug',
-            'Therapeutic_or_preventive_procedure': 'Treatment',
-            'Diagnostic_procedure':                'Treatment',
-            'Biological_structure':                'Treatment',
+            # Disease entities
+            'Disease_disorder':    'Disease',
+            'History':             'Disease',   # past medical history
+            'Family_history':      'Disease',   # family history of conditions
+            # Symptom entities
+            'Sign_symptom':        'Symptom',
+            # Drug/medication entities
+            'Medication':          'Drug',
+            # Treatment entities — NOTE: model uses 'Therapeutic_procedure'
+            # NOT 'Therapeutic_or_preventive_procedure'
+            'Therapeutic_procedure':             'Treatment',
+            'Therapeutic_or_preventive_procedure':'Treatment',  # keep both variants
+            'Clinical_event':                    'Treatment',   # e.g. 'admitted', 'presented'
         }
         entities: dict[str, list] = {
             'Disease': [], 'Drug': [], 'Symptom': [], 'Treatment': []
@@ -511,9 +630,23 @@ class MediPipeline:
             'Disease': [], 'Drug': [], 'Symptom': [], 'Treatment': []
         }
 
-        try:
-            raw_entities  = self._run_ner_chunked(text)
-            merged        = merge_subword_entities(raw_entities)
+        def _extract_entities_from_text(source_text: str, thresholds: dict) -> tuple:
+            """
+            Run NER on source_text and return (entities_dict, scores_dict).
+            This is called once for standard mode (full text only) and twice
+            for high-accuracy mode (full text + BART summary).
+            """
+            ents_out   = {'Disease': [], 'Drug': [], 'Symptom': [], 'Treatment': []}
+            scores_out = {'Disease': [], 'Drug': [], 'Symptom': [], 'Treatment': []}
+
+            raw    = self._run_ner_chunked(source_text)
+            merged = merge_subword_entities(raw)
+
+            # Build dosage lookup
+            dosage_map = {}
+            for ent in merged:
+                if ent.get('entity_group') == 'Dosage':
+                    dosage_map[ent.get('start', -1)] = ent['word'].strip()
 
             for ent in merged:
                 cat = CAT_MAP.get(ent.get('entity_group', ''))
@@ -522,23 +655,75 @@ class MediPipeline:
                 word  = ent['word'].strip()
                 score = float(ent.get('score', 0.0))
 
-                # Apply multi-layer noise filter
-                if not is_valid_entity(word, score, score_threshold=0.87):
+                if is_negated_entity(word):
                     continue
 
-                # Title-case the entity for presentation
+                threshold = thresholds.get(cat, 0.80)
+                if not is_valid_entity(word, score, score_threshold=threshold):
+                    continue
+
                 display_word = word.title() if not any(c.isupper() for c in word[1:]) else word
 
-                if display_word not in entities[cat]:
-                    entities[cat].append(display_word)
-                    entity_scores[cat].append(round(score * 100, 1))
+                # Append dosage to Drug entries if immediately adjacent
+                if cat == 'Drug':
+                    ent_end = ent.get('end', -1)
+                    for dos_start, dos_str in dosage_map.items():
+                        if abs(dos_start - ent_end) <= 2:
+                            display_word = display_word + ' ' + dos_str
+                            break
 
-            # Deduplicate within each category
+                if display_word not in ents_out[cat]:
+                    ents_out[cat].append(display_word)
+                    scores_out[cat].append(round(score * 100, 1))
+
+            return ents_out, scores_out
+
+        try:
+            # Per-category confidence thresholds
+            THRESHOLDS = {
+                'Disease':   0.80,
+                'Symptom':   0.80,
+                'Drug':      0.75,
+                'Treatment': 0.50,
+            }
+
+            if use_lstm:
+                # ── Standard mode: single-pass NER on full text ──
+                logger.debug("NER: single-pass (standard mode)")
+                entities, entity_scores = _extract_entities_from_text(text, THRESHOLDS)
+            else:
+                # ── High-Accuracy mode: double-pass NER ──────────
+                # Pass 1: Full text — broad coverage
+                # Pass 2: BART summary — high-precision, focused
+                # Merge: summary-pass entities take priority (they appear first),
+                #        then add any additional entities from full-text pass.
+                logger.debug("NER: double-pass (high-accuracy mode)")
+
+                sum_ents, sum_scores = _extract_entities_from_text(bart_out, THRESHOLDS)
+                full_ents, full_scores = _extract_entities_from_text(text, THRESHOLDS)
+
+                # Merge: summary entities first (higher precision),
+                # then fill in from full-text pass
+                for cat in entities:
+                    seen = set()
+                    for i, e in enumerate(sum_ents[cat]):
+                        if e.lower() not in seen:
+                            entities[cat].append(e)
+                            entity_scores[cat].append(sum_scores[cat][i])
+                            seen.add(e.lower())
+                    for i, e in enumerate(full_ents[cat]):
+                        if e.lower() not in seen:
+                            entities[cat].append(e)
+                            entity_scores[cat].append(full_scores[cat][i])
+                            seen.add(e.lower())
+
+            # Final deduplication within each category
             for cat in entities:
                 entities[cat] = deduplicate_entities(entities[cat])
 
         except Exception as e:
             logger.error("NER failed: %s", str(e))
+
 
         # ── Stage 4: Risk Classification & Confidence ─────────
         risk       = classify_risk(entities, text)
